@@ -2,7 +2,7 @@
 """
 annotate_images.py - Enhanced with context-aware categorization
 
-Read a markdown file, find all image references, ask a local Ollama model
+Read a markdown file, find all image references, ask a multimodal model
 to (1) categorize the diagram type using surrounding context and (2) generate a detailed technical description.
 Two markdown files are written:
 
@@ -16,15 +16,14 @@ Usage
         --output path/to/file_annotated.md \
         --summary path/to/summary.md \
         --categories img-parse/image_categories.json \
-        --model qwen3-vl:30b   # any Ollama vision model
+        --model qwen3-vl:30b   # any supported vision model
 
 Dependencies (install with uv)
 ---------------
-    uv add requests pillow rich
+    uv add requests pillow rich python-dotenv
 """
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -33,60 +32,13 @@ import unicodedata
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
-import requests
-from PIL import Image
 from rich.console import Console
 from rich.progress import track
+from vision_clients import create_vision_client, VisionClient
+from PIL import Image
 
-# ---------------------------------------------------------------
-# Ollama helper
-# ---------------------------------------------------------------
-OLLAMA_URL = "http://localhost:11434/api/chat"
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MiB
 CONTEXT_CHARS = 500  # Characters of context to extract before/after image
-
-
-def _load_image_as_base64(image_path: Path) -> str:
-    """Read an image file and return a base64‑encoded string."""
-    with image_path.open("rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def call_ollama(
-    model: str,
-    prompt: str,
-    image_path: Path | None = None,
-    temperature: float = 0.0,
-) -> str:
-    """
-    Send a request to the local Ollama server with proper image handling.
-    """
-    # Build message with image attached if provided
-    message = {"role": "user", "content": prompt}
-    
-    if image_path:
-        # Verify image validity
-        Image.open(image_path).verify()
-        # Attach image to the message object
-        message["images"] = [_load_image_as_base64(image_path)]
-    
-    payload = {
-        "model": model,
-        "messages": [message],
-        "options": {
-            "temperature": temperature,
-        },
-        "stream": False,
-    }
-
-    try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=180)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "").strip()
-    except Exception as exc:
-        sys.stderr.write(f"[ERROR] Ollama request failed: {exc}\n")
-        return ""
 
 
 # ---------------------------------------------------------------
@@ -147,6 +99,7 @@ def pre_categorize_with_context(
     context_info: Dict[str, str],
     categories: List[str],
     model: str,
+    vision_client: VisionClient,
     temperature: float = 0.1
 ) -> Optional[str]:
     """
@@ -183,11 +136,15 @@ Look for keywords that indicate the diagram type:
 
 Reply with ONLY the most likely category name. If you cannot determine with reasonable confidence, reply with "unknown"."""
 
-    response = call_ollama(
-        model=model,
-        prompt=prompt,
-        temperature=temperature
-    )
+    try:
+        response = vision_client.generate(
+            model=model,
+            prompt=prompt,
+            temperature=temperature,
+        )
+    except Exception as exc:
+        sys.stderr.write(f"[ERROR] Vision request failed during pre-categorization: {exc}\n")
+        return None
     
     # Normalize the response
     if response:
@@ -203,6 +160,18 @@ def load_categories_config(json_path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def build_fallback_description_prompt(category: str) -> str:
+    return f"""Describe this {category} briefly but concretely.
+
+List only:
+1. Main classes or elements
+2. Key relationships and cardinalities if visible
+3. Inheritance, aggregation, or composition if visible
+4. Any obvious notation or quality issues
+
+If something is unclear, say so instead of guessing."""
+
+
 # ---------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------
@@ -212,16 +181,29 @@ def main() -> None:
     )
     parser.add_argument("--input", required=True, help="Path to source .md file")
     parser.add_argument("--output", required=True, help="Path for annotated .md file")
-    parser.add_argument("--summary", required=True, help="Path for summary .md file")
+    parser.add_argument("--summary", help="Path for summary .md file")
     parser.add_argument(
         "--categories",
-        required=True,
-        help="JSON file with categories and description prompts",
+        default=str(Path(__file__).resolve().parent / "image_categories_enhanced.json"),
+        help="JSON file with diagram categories and prompts",
+    )
+    parser.add_argument(
+        "--provider",
+        default="ollama",
+        help="Vision provider to use: ollama or opencode-go (default: ollama)",
     )
     parser.add_argument(
         "--model",
         default="qwen3-vl:30b",
-        help="Ollama vision model (default: qwen3-vl:30b)",
+        help="Vision model identifier for the selected provider",
+    )
+    parser.add_argument(
+        "--api-key",
+        help="API key for hosted providers. If omitted, environment variables are used.",
+    )
+    parser.add_argument(
+        "--base-url",
+        help="Override provider base URL or endpoint when needed.",
     )
     parser.add_argument(
         "--context-size",
@@ -241,8 +223,17 @@ def main() -> None:
     # Resolve paths
     input_md_path = Path(args.input).resolve()
     output_md_path = Path(args.output).resolve()
-    summary_md_path = Path(args.summary).resolve()
+    summary_md_path = (
+        Path(args.summary).resolve()
+        if args.summary
+        else output_md_path.with_name(f"{output_md_path.stem}_summary.md")
+    )
     categories_path = Path(args.categories).resolve()
+    vision_client = create_vision_client(
+        provider=args.provider,
+        api_key=args.api_key,
+        base_url=args.base_url,
+    )
 
     # Validate input
     if not input_md_path.is_file():
@@ -330,6 +321,7 @@ def main() -> None:
                         img_info,
                         categories,
                         args.model,
+                        vision_client,
                         temperature=0.1
                     )
                     
@@ -358,12 +350,16 @@ Reply with only the category name, nothing else."""
                     if args.verbose:
                         console.print("  [dim]Detecting diagram type from image...[/dim]")
                     
-                    category_response = call_ollama(
-                        model=args.model,
-                        prompt=cat_prompt,
-                        image_path=img_path,
-                        temperature=0.0,
-                    )
+                    try:
+                        category_response = vision_client.generate(
+                            model=args.model,
+                            prompt=cat_prompt,
+                            image_path=img_path,
+                            temperature=0.0,
+                        )
+                    except Exception as exc:
+                        console.print(f"[red]Category request failed: {exc}[/red]")
+                        category_response = ""
                     
                     # Normalize category
                     category = category_response.lower().strip()
@@ -401,12 +397,31 @@ Reply with only the category name, nothing else."""
                     if args.verbose:
                         console.print("  [dim]Generating technical description...[/dim]")
                     
-                    description = call_ollama(
-                        model=args.model,
-                        prompt=desc_prompt,
-                        image_path=img_path,
-                        temperature=0.1,
-                    )
+                    try:
+                        description = vision_client.generate(
+                            model=args.model,
+                            prompt=desc_prompt,
+                            image_path=img_path,
+                            temperature=0.1,
+                        )
+                    except Exception as exc:
+                        console.print(f"[red]Description request failed: {exc}[/red]")
+                        description = ""
+
+                    if not description:
+                        fallback_prompt = build_fallback_description_prompt(category)
+                        try:
+                            description = vision_client.generate(
+                                model=args.model,
+                                prompt=fallback_prompt,
+                                image_path=img_path,
+                                temperature=0.1,
+                            )
+                            if args.verbose and description:
+                                console.print("  [yellow]Used fallback description prompt[/yellow]")
+                        except Exception as exc:
+                            console.print(f"[red]Fallback description request failed: {exc}[/red]")
+                            description = ""
                     
                     if not description:
                         description = "No description generated."
@@ -467,14 +482,14 @@ Reply with only the category name, nothing else."""
     summary_md_path.write_text("".join(summary_lines), encoding="utf-8")
 
     # Final report
-    console.print(f"\n[green bold]✅ Processing Complete[/green bold]")
-    console.print(f"📄 Annotated document: [cyan]{output_md_path}[/cyan]")
-    console.print(f"📊 Summary document: [cyan]{summary_md_path}[/cyan]")
+    console.print(f"\n[green bold]Processing complete[/green bold]")
+    console.print(f"Annotated document: [cyan]{output_md_path}[/cyan]")
+    console.print(f"Summary document: [cyan]{summary_md_path}[/cyan]")
     
     if category_counts:
         console.print(f"\n[yellow]Category Distribution:[/yellow]")
         for cat, count in sorted(category_counts.items()):
-            console.print(f"  • {cat.replace('_', ' ').title()}: {count}")
+            console.print(f"  - {cat.replace('_', ' ').title()}: {count}")
     
     if context_predictions["total"] > 0:
         accuracy = (context_predictions["correct"] / context_predictions["total"]) * 100
