@@ -1,8 +1,8 @@
 # Diagram Annotator for Technical Documentation
 
-A powerful Python tool that automatically identifies, categorizes, and generates detailed technical descriptions for diagrams in markdown documentation using vision-capable Large Language Models (LLMs) through Ollama.
+A powerful Python tool that automatically identifies, categorizes, and generates detailed technical descriptions for diagrams in markdown documentation using vision-capable Large Language Models (LLMs).
 
-Since the software is intended to be used in academical settings, we use Ollama to leverage local MLLMs like qwen3-vl:32b (the tested model).
+DiagramLens now supports both local execution through `Ollama` and hosted multimodal execution through `OpenCode Go`.
 
 The system performs well with md. files generated with PDF OCR analyzers like https://github.com/granludo/deepseekocr-mlx (the one we tested).
 
@@ -42,13 +42,17 @@ Supports 35+ diagram types including:
 ## 📋 Requirements
 
 - Python 3.8+
-- [Ollama](https://ollama.ai/) installed and running locally
-- A vision-capable model installed in Ollama (e.g., `qwen2-vl:7b`, `llava`, `bakllava`)
+- One supported vision backend:
+  - [Ollama](https://ollama.ai/) installed and running locally
+  - or `OpenCode Go` with `OPENCODE_API_KEY`
+- A vision-capable model available in the selected provider
 - [uv](https://github.com/astral-sh/uv) for dependency management (recommended)
 
 ## 🚀 Installation
 
-### 1. Install Ollama
+### 1. Choose a Provider
+
+#### Option A. Ollama
 ```bash
 # macOS/Linux
 curl -fsSL https://ollama.ai/install.sh | sh
@@ -57,7 +61,12 @@ curl -fsSL https://ollama.ai/install.sh | sh
 ollama serve
 ```
 
-### 2. Pull a Vision Model
+#### Option B. OpenCode Go
+```bash
+export OPENCODE_API_KEY=your_key
+```
+
+### 2. Prepare a Vision Model
 ```bash
 # Recommended: Qwen2-VL (good balance of quality and speed)
 ollama pull qwen2-vl:7b
@@ -70,10 +79,10 @@ ollama pull qwen2-vl:7b
 ### 3. Install Python Dependencies
 ```bash
 # Using uv (recommended)
-uv add requests pillow rich
+uv add requests pillow rich python-dotenv
 
 # Or using pip
-pip install requests pillow rich
+pip install requests pillow rich python-dotenv
 ```
 
 ## 💻 Usage
@@ -84,18 +93,29 @@ uv run annotate_images_enhanced.py \
     --input docs/architecture.md \
     --output docs/architecture_annotated.md \
     --summary docs/diagram_summary.md \
-    --categories image_categories_enhanced.json \
     --model qwen3-vl:8b
+```
+
+### Basic Usage with OpenCode Go
+```bash
+export OPENCODE_API_KEY=your_key
+
+uv run annotate_images_enhanced.py \
+    --provider opencode-go \
+    --input docs/architecture.md \
+    --output docs/architecture_annotated.md \
+    --summary docs/diagram_summary.md \
+    --model qwen3.7-plus
 ```
 
 ### Advanced Options
 ```bash
 uv run annotate_images_enhanced.py \
+    --provider opencode-go \
     --input docs/architecture.md \
     --output docs/architecture_annotated.md \
     --summary docs/diagram_summary.md \
-    --categories image_categories_enhanced.json \
-    --model qwen3-vl:32b \
+    --model qwen3.7-plus \
     --context-size 750 \    # Amount of surrounding text to analyze
     --verbose              # Show detailed progress
 ```
@@ -106,9 +126,12 @@ uv run annotate_images_enhanced.py \
 |----------|-------------|----------|---------|
 | `--input` | Path to source markdown file | Yes | - |
 | `--output` | Path for annotated markdown output | Yes | - |
-| `--summary` | Path for diagram summary output | Yes | - |
-| `--categories` | JSON file with diagram categories | Yes | - |
-| `--model` | Ollama vision model to use | No | `qwen2-vl:7b` |
+| `--summary` | Path for diagram summary output | No | `<output>_summary.md` |
+| `--categories` | JSON file with diagram categories | No | `image_categories_enhanced.json` |
+| `--provider` | Vision provider: `ollama` or `opencode-go` | No | `ollama` |
+| `--model` | Vision model identifier | No | `qwen3-vl:30b` |
+| `--api-key` | API key override for hosted providers | No | env var |
+| `--base-url` | Provider endpoint override | No | provider default |
 | `--context-size` | Characters of context to analyze | No | 500 |
 | `--verbose` | Show detailed progress | No | False |
 
@@ -162,6 +185,7 @@ Different models offer different trade-offs:
 | `qwen2-vl:72b` | Excellent | Slow | 40GB+ | High accuracy |
 | `llava:13b` | Good | Medium | 16GB | Balanced |
 | `bakllava` | Fair | Fast | 8GB | Quick processing |
+| `qwen3.7-plus` | Very Good | Medium | Hosted | Remote multimodal evaluation |
 
 ## 📊 Output Examples
 
