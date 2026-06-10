@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -98,10 +99,11 @@ def find_image_refs_with_context(md_text: str, context_size: int = CONTEXT_CHARS
 def pre_categorize_with_context(
     context_info: Dict[str, str],
     categories: List[str],
+    provider: str,
     model: str,
     vision_client: VisionClient,
     temperature: float = 0.1
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
     Use surrounding text context to predict the diagram type before image analysis.
     Returns a predicted category or None if uncertain.
@@ -137,21 +139,25 @@ Look for keywords that indicate the diagram type:
 Reply with ONLY the most likely category name. If you cannot determine with reasonable confidence, reply with "unknown"."""
 
     try:
-        response = vision_client.generate(
+        response, telemetry = invoke_vision(
+            vision_client=vision_client,
+            provider=provider,
             model=model,
             prompt=prompt,
             temperature=temperature,
+            phase="pre_categorization",
+            image_ref=context_info["path"],
         )
     except Exception as exc:
         sys.stderr.write(f"[ERROR] Vision request failed during pre-categorization: {exc}\n")
-        return None
+        return None, None
     
     # Normalize the response
     if response:
         response = response.lower().strip()
         if response in [c.lower() for c in categories]:
-            return response
-    return None
+            return response, telemetry
+    return None, telemetry
 
 
 def load_categories_config(json_path: Path) -> Dict[str, Any]:
@@ -172,6 +178,159 @@ List only:
 If something is unclear, say so instead of guessing."""
 
 
+def coerce_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def coerce_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def estimate_tokens_from_text(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def estimate_cost_usd(
+    provider: str,
+    model: str,
+    tokens_input: int,
+    tokens_output: int,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    provider_reported_cost_usd: float | None = None,
+) -> float:
+    if provider_reported_cost_usd is not None and provider_reported_cost_usd > 0:
+        return round(provider_reported_cost_usd, 6)
+
+    provider_key = provider.strip().casefold()
+    if provider_key == "ollama":
+        return 0.0
+
+    if provider_key in {"opencode-go", "opencode_go", "opencode"}:
+        model_key = model.strip().casefold()
+        pricing_table = {
+            "qwen3.7-max": [
+                {"max_total_input_tokens": None, "input": 2.50, "output": 7.50, "cache_read": 0.50, "cache_write": 3.125},
+            ],
+            "qwen3.7-plus": [
+                {"max_total_input_tokens": 256000, "input": 0.40, "output": 1.60, "cache_read": 0.04, "cache_write": 0.50},
+                {"max_total_input_tokens": None, "input": 1.20, "output": 4.80, "cache_read": 0.12, "cache_write": 1.50},
+            ],
+            "qwen3.6-plus": [
+                {"max_total_input_tokens": 256000, "input": 0.50, "output": 3.00, "cache_read": 0.05, "cache_write": 0.625},
+                {"max_total_input_tokens": None, "input": 2.00, "output": 6.00, "cache_read": 0.20, "cache_write": 2.50},
+            ],
+        }
+        tiers = pricing_table.get(model_key)
+        if not tiers:
+            return 0.0
+        total_input_for_tier = tokens_input + cache_read_input_tokens + cache_creation_input_tokens
+        tier = tiers[-1]
+        for candidate in tiers:
+            max_tokens = candidate["max_total_input_tokens"]
+            if max_tokens is None or total_input_for_tier <= max_tokens:
+                tier = candidate
+                break
+        return round(
+            (tokens_input / 1_000_000) * tier["input"]
+            + (tokens_output / 1_000_000) * tier["output"]
+            + (cache_read_input_tokens / 1_000_000) * tier["cache_read"]
+            + (cache_creation_input_tokens / 1_000_000) * tier["cache_write"],
+            6,
+        )
+
+    return 0.0
+
+
+def invoke_vision(
+    vision_client: VisionClient,
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+    image_path: Optional[Path] = None,
+    temperature: float = 0.0,
+    phase: str,
+    image_ref: str,
+) -> Tuple[str, Dict[str, Any]]:
+    started = time.perf_counter()
+    response = vision_client.generate(
+        model=model,
+        prompt=prompt,
+        image_path=image_path,
+        temperature=temperature,
+    )
+    latency_seconds = round(time.perf_counter() - started, 4)
+    meta = getattr(vision_client, "last_response_meta", None) or {}
+    usage = meta.get("usage") if isinstance(meta, dict) and isinstance(meta.get("usage"), dict) else {}
+    input_tokens = coerce_int(usage.get("input_tokens")) or estimate_tokens_from_text(prompt)
+    output_tokens = coerce_int(usage.get("output_tokens")) or estimate_tokens_from_text(response)
+    cache_read_input_tokens = coerce_int(usage.get("cache_read_input_tokens"))
+    cache_creation_input_tokens = coerce_int(usage.get("cache_creation_input_tokens"))
+    provider_reported_cost = coerce_float(meta.get("cost")) if isinstance(meta, dict) else None
+    telemetry = {
+        "phase": phase,
+        "image_ref": image_ref,
+        "provider": provider,
+        "model": model,
+        "tokens_input": input_tokens,
+        "tokens_output": output_tokens,
+        "tokens_total": input_tokens + output_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "latency_seconds": latency_seconds,
+        "provider_reported_cost_usd": provider_reported_cost,
+        "cost_estimated_usd": estimate_cost_usd(
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            provider_reported_cost_usd=provider_reported_cost,
+        ),
+        "usage_source": "provider_usage" if usage else "estimated_chars_div_4",
+    }
+    return response, telemetry
+
+
+def build_telemetry_summary(
+    *,
+    provider: str,
+    model: str,
+    input_md_path: Path,
+    output_md_path: Path,
+    summary_md_path: Path,
+    calls: List[Dict[str, Any]],
+    diagrams_total: int,
+) -> Dict[str, Any]:
+    return {
+        "provider": provider,
+        "model": model,
+        "input_path": str(input_md_path),
+        "output_path": str(output_md_path),
+        "summary_path": str(summary_md_path),
+        "diagrams_total": diagrams_total,
+        "model_calls_total": len(calls),
+        "tokens_input": sum(call["tokens_input"] for call in calls),
+        "tokens_output": sum(call["tokens_output"] for call in calls),
+        "tokens_total": sum(call["tokens_total"] for call in calls),
+        "cache_read_input_tokens": sum(call.get("cache_read_input_tokens", 0) for call in calls),
+        "cache_creation_input_tokens": sum(call.get("cache_creation_input_tokens", 0) for call in calls),
+        "latency_seconds": round(sum(call["latency_seconds"] for call in calls), 4),
+        "cost_estimated_usd": round(sum(call.get("cost_estimated_usd", 0.0) for call in calls), 6),
+        "calls": calls,
+    }
+
+
 # ---------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------
@@ -182,6 +341,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Path to source .md file")
     parser.add_argument("--output", required=True, help="Path for annotated .md file")
     parser.add_argument("--summary", help="Path for summary .md file")
+    parser.add_argument("--telemetry-output", help="Path for operational telemetry JSON output")
     parser.add_argument(
         "--categories",
         default=str(Path(__file__).resolve().parent / "image_categories_enhanced.json"),
@@ -228,6 +388,7 @@ def main() -> None:
         if args.summary
         else output_md_path.with_name(f"{output_md_path.stem}_summary.md")
     )
+    telemetry_output_path = Path(args.telemetry_output).resolve() if args.telemetry_output else None
     categories_path = Path(args.categories).resolve()
     vision_client = create_vision_client(
         provider=args.provider,
@@ -274,6 +435,7 @@ def main() -> None:
     last_idx = 0
     category_counts = {}
     context_predictions = {"correct": 0, "total": 0}
+    telemetry_calls: List[Dict[str, Any]] = []
 
     # Progress tracking
     iterator = track(image_refs, description="Processing diagrams...") if not args.verbose else image_refs
@@ -317,13 +479,16 @@ def main() -> None:
                     if args.verbose:
                         console.print("  [dim]Analyzing context for category hints...[/dim]")
                     
-                    predicted_category = pre_categorize_with_context(
+                    predicted_category, context_telemetry = pre_categorize_with_context(
                         img_info,
                         categories,
+                        args.provider,
                         args.model,
                         vision_client,
                         temperature=0.1
                     )
+                    if context_telemetry:
+                        telemetry_calls.append(context_telemetry)
                     
                     if predicted_category and args.verbose:
                         console.print(f"  [blue]Context suggests: {predicted_category}[/blue]")
@@ -351,12 +516,17 @@ Reply with only the category name, nothing else."""
                         console.print("  [dim]Detecting diagram type from image...[/dim]")
                     
                     try:
-                        category_response = vision_client.generate(
+                        category_response, category_telemetry = invoke_vision(
+                            vision_client=vision_client,
+                            provider=args.provider,
                             model=args.model,
                             prompt=cat_prompt,
                             image_path=img_path,
                             temperature=0.0,
+                            phase="diagram_categorization",
+                            image_ref=img_info["path"],
                         )
+                        telemetry_calls.append(category_telemetry)
                     except Exception as exc:
                         console.print(f"[red]Category request failed: {exc}[/red]")
                         category_response = ""
@@ -398,12 +568,17 @@ Reply with only the category name, nothing else."""
                         console.print("  [dim]Generating technical description...[/dim]")
                     
                     try:
-                        description = vision_client.generate(
+                        description, description_telemetry = invoke_vision(
+                            vision_client=vision_client,
+                            provider=args.provider,
                             model=args.model,
                             prompt=desc_prompt,
                             image_path=img_path,
                             temperature=0.1,
+                            phase="diagram_description",
+                            image_ref=img_info["path"],
                         )
+                        telemetry_calls.append(description_telemetry)
                     except Exception as exc:
                         console.print(f"[red]Description request failed: {exc}[/red]")
                         description = ""
@@ -411,12 +586,17 @@ Reply with only the category name, nothing else."""
                     if not description:
                         fallback_prompt = build_fallback_description_prompt(category)
                         try:
-                            description = vision_client.generate(
+                            description, fallback_telemetry = invoke_vision(
+                                vision_client=vision_client,
+                                provider=args.provider,
                                 model=args.model,
                                 prompt=fallback_prompt,
                                 image_path=img_path,
                                 temperature=0.1,
+                                phase="fallback_description",
+                                image_ref=img_info["path"],
                             )
+                            telemetry_calls.append(fallback_telemetry)
                             if args.verbose and description:
                                 console.print("  [yellow]Used fallback description prompt[/yellow]")
                         except Exception as exc:
@@ -481,10 +661,31 @@ Reply with only the category name, nothing else."""
     summary_md_path.parent.mkdir(parents=True, exist_ok=True)
     summary_md_path.write_text("".join(summary_lines), encoding="utf-8")
 
+    if telemetry_output_path:
+        telemetry_output_path.parent.mkdir(parents=True, exist_ok=True)
+        telemetry_output_path.write_text(
+            json.dumps(
+                build_telemetry_summary(
+                    provider=args.provider,
+                    model=args.model,
+                    input_md_path=input_md_path,
+                    output_md_path=output_md_path,
+                    summary_md_path=summary_md_path,
+                    calls=telemetry_calls,
+                    diagrams_total=len(image_refs),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     # Final report
     console.print(f"\n[green bold]Processing complete[/green bold]")
     console.print(f"Annotated document: [cyan]{output_md_path}[/cyan]")
     console.print(f"Summary document: [cyan]{summary_md_path}[/cyan]")
+    if telemetry_output_path:
+        console.print(f"Telemetry: [cyan]{telemetry_output_path}[/cyan]")
     
     if category_counts:
         console.print(f"\n[yellow]Category Distribution:[/yellow]")

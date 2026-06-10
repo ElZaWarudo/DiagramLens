@@ -63,6 +63,9 @@ def _validate_image(image_path: Path) -> None:
 
 
 class VisionClient(ABC):
+    def __init__(self):
+        self.last_response_meta = None
+
     @abstractmethod
     def generate(
         self,
@@ -76,6 +79,7 @@ class VisionClient(ABC):
 
 class OllamaVisionClient(VisionClient):
     def __init__(self, base_url: str = DEFAULT_OLLAMA_URL):
+        super().__init__()
         self.base_url = base_url
 
     def generate(
@@ -85,6 +89,7 @@ class OllamaVisionClient(VisionClient):
         image_path: Optional[Path] = None,
         temperature: float = 0.0,
     ) -> str:
+        self.last_response_meta = None
         message = {"role": "user", "content": prompt}
 
         if image_path:
@@ -101,6 +106,20 @@ class OllamaVisionClient(VisionClient):
         resp = requests.post(self.base_url, json=payload, timeout=180)
         resp.raise_for_status()
         data = resp.json()
+        self.last_response_meta = {
+            "provider": "ollama",
+            "usage": {
+                "input_tokens": data.get("prompt_eval_count"),
+                "output_tokens": data.get("eval_count"),
+            },
+            "timing": {
+                "total_duration_ns": data.get("total_duration"),
+                "load_duration_ns": data.get("load_duration"),
+                "prompt_eval_duration_ns": data.get("prompt_eval_duration"),
+                "eval_duration_ns": data.get("eval_duration"),
+            },
+            "model": data.get("model", model),
+        }
         return data.get("message", {}).get("content", "").strip()
 
 
@@ -110,6 +129,7 @@ class OpenCodeGoVisionClient(VisionClient):
         api_key: Optional[str] = None,
         base_url: str = DEFAULT_OPENCODE_GO_MESSAGES_URL,
     ):
+        super().__init__()
         self.api_key = (
             api_key
             or os.environ.get("OPENCODE_API_KEY")
@@ -126,6 +146,7 @@ class OpenCodeGoVisionClient(VisionClient):
         image_path: Optional[Path] = None,
         temperature: float = 0.0,
     ) -> str:
+        self.last_response_meta = None
         content: list[dict[str, object]] = []
 
         if image_path:
@@ -165,6 +186,13 @@ class OpenCodeGoVisionClient(VisionClient):
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                self.last_response_meta = {
+                    "provider": "opencode_go",
+                    "usage": data.get("usage"),
+                    "cost": data.get("cost"),
+                    "model": data.get("model", model),
+                    "stop_reason": data.get("stop_reason"),
+                }
                 blocks = data.get("content", [])
                 texts = [block.get("text", "") for block in blocks if block.get("type") == "text"]
                 return "\n".join(item for item in texts if item).strip()
